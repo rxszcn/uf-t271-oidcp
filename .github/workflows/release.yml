@@ -1,0 +1,183 @@
+name: Release
+
+permissions: {}
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false # Let publishing finish before another run of this tag.
+
+jobs:
+  release:
+    permissions:
+      actions: read # Read workflow metadata for npm provenance and attestations.
+      attestations: write # Publish package attestations.
+      artifact-metadata: write # Associate package artifacts with attestations.
+      contents: write # Publish GitHub releases and update release branches.
+      discussions: write # Create release discussions.
+      id-token: write # Authenticate npm publishing and sign attestations.
+    uses: panva/.github/.github/workflows/npm-release.yml@75ad63f5730195dd3e9ec22dbbf29101c99d8501 # v4
+    with:
+      artifact_check_command: node tools/test-dist.js "$PACKAGE_TARBALL"
+      package_directory: ./dist
+      prepare_command: npm clean-install --ignore-scripts && npm run build
+
+  definitely-typed:
+    name: DefinitelyTyped release handoff
+    needs: release
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout released oidc-provider tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          path: provider
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Checkout DefinitelyTyped master
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          repository: DefinitelyTyped/DefinitelyTyped
+          path: definitely-typed
+          persist-credentials: false
+          ref: master
+          sparse-checkout: |
+            types/oidc-provider
+
+      - name: Setup node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: definitely-typed/package.json
+
+      - name: Verify released tag
+        working-directory: provider
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+
+            const tag = process.env.GITHUB_REF_NAME;
+            const version = JSON.parse(readFileSync("package.json", "utf8")).version;
+            if (`v${version}` !== tag) {
+              throw new Error(`release tag ${tag} does not match package version ${version}`);
+            }
+          '
+
+      - name: Install handoff dependencies
+        run: |
+          set -euo pipefail
+          npm clean-install --ignore-scripts --prefix provider
+          pnpm --dir definitely-typed install --filter definitely-typed --ignore-scripts --no-frozen-lockfile
+
+      - name: Generate provider types handoff bundle
+        working-directory: provider
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/oidc-provider-types"
+          node docs/update-configuration.js --types-json \
+            > "$RUNNER_TEMP/oidc-provider-types/oidc-provider-types.json"
+          cp tools/dt/update-types.mjs tools/dt/sync-release.mjs \
+            tools/dt/update-types.test.mjs tools/dt/sync-release.test.mjs tools/dt/README.md \
+            "$RUNNER_TEMP/oidc-provider-types/"
+
+      - name: Inspect DefinitelyTyped update
+        id: inspect_types
+        working-directory: provider
+        run: |
+          set -euo pipefail
+          node tools/dt/update-types.mjs \
+            --package-dir "$GITHUB_WORKSPACE/definitely-typed/types/oidc-provider" \
+            --status \
+            --artifact "$RUNNER_TEMP/oidc-provider-types/oidc-provider-types.json" \
+            > "$RUNNER_TEMP/oidc-provider-types-status.json"
+          node --input-type=module -e '
+            import { appendFileSync, readFileSync } from "node:fs";
+
+            const status = JSON.parse(readFileSync(process.env.STATUS_FILE, "utf8"));
+            if (status.schemaVersion !== 1 || typeof status.updateRequired !== "boolean") {
+              throw new Error("DefinitelyTyped updater returned an invalid status document");
+            }
+            if (!Array.isArray(status.reasons)
+              || status.reasons.some((reason) => !["declarations", "tests", "major-version"].includes(reason))) {
+              throw new Error("DefinitelyTyped updater returned invalid update reasons");
+            }
+
+            appendFileSync(
+              process.env.GITHUB_OUTPUT,
+              `update_required=${status.updateRequired}\nreasons=${status.reasons.join(", ")}\n`,
+            );
+
+            if (status.warning !== undefined) {
+              if (typeof status.warning !== "string") {
+                throw new Error("DefinitelyTyped updater returned an invalid warning");
+              }
+              console.log(`DefinitelyTyped release handoff: ${status.warning}`);
+            }
+          '
+        env:
+          STATUS_FILE: ${{ runner.temp }}/oidc-provider-types-status.json
+
+      - name: Upload provider types handoff bundle
+        id: upload_artifact
+        if: ${{ steps.inspect_types.outputs.update_required == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oidc-provider-types-${{ github.ref_name }}
+          path: ${{ runner.temp }}/oidc-provider-types/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Report DefinitelyTyped handoff
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [[ "$STATUS_OUTCOME" != "success" ]]; then
+            echo "::warning title=DefinitelyTyped release handoff::The type update check did not complete;" \
+              "the npm release is unaffected. Inspect this job and run the DT updater manually."
+          elif [[ "$UPDATE_REQUIRED" == "true" && "$UPLOAD_OUTCOME" != "success" ]]; then
+            echo "::warning title=DefinitelyTyped release handoff::A type update is required," \
+              "but its handoff artifact could not be uploaded. The npm release is unaffected."
+          elif [[ "$UPDATE_REQUIRED" == "true" ]]; then
+            echo "::notice title=DefinitelyTyped update available::Download and run the released" \
+              "sync tools using the commands in this job summary."
+            printf '%s\n' \
+              '## DefinitelyTyped update available' \
+              '' \
+              "The released type definitions or tests require an update (${UPDATE_REASONS}). From a DefinitelyTyped checkout, run:" \
+              '' \
+              '```sh' \
+              'bundle="$(mktemp -d)"' \
+              "gh run download '${GITHUB_RUN_ID}' \\" \
+              "  --repo '${GITHUB_REPOSITORY}' \\" \
+              "  --name 'oidc-provider-types-${GITHUB_REF_NAME}' \\" \
+              '  --dir "$bundle"' \
+              'node "$bundle/sync-release.mjs" \' \
+              '  --repository "$PWD" \' \
+              "  --tag '${GITHUB_REF_NAME}' \\" \
+              '  --artifact "$bundle/oidc-provider-types.json" \' \
+              '  --submit' \
+              '```' \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No DefinitelyTyped update is required for ${GITHUB_REF_NAME}."
+          fi
+        env:
+          STATUS_OUTCOME: ${{ steps.inspect_types.outcome }}
+          UPDATE_REQUIRED: ${{ steps.inspect_types.outputs.update_required }}
+          UPDATE_REASONS: ${{ steps.inspect_types.outputs.reasons }}
+          UPLOAD_OUTCOME: ${{ steps.upload_artifact.outcome }}

@@ -1,0 +1,182 @@
+import assert from 'node:assert/strict';
+import { createWriteStream, writeFileSync } from 'node:fs';
+import * as stream from 'node:stream';
+import { promisify } from 'node:util';
+
+import ms from 'ms';
+
+import debug from './debug.js';
+
+const pipeline = promisify(stream.pipeline);
+
+const FINISHED = new Set(['FINISHED']);
+const RESULTS = new Set(['REVIEW', 'PASSED', 'WARNING', 'SKIPPED']);
+const MAX_ERROR_BODY_LENGTH = 4000;
+const PLAN_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+export function assertPlanId(planId) {
+  assert(typeof planId === 'string' && PLAN_ID_PATTERN.test(planId), 'argument property "planId" is invalid');
+}
+
+async function assertResponseStatus(response, expected) {
+  if (response.status === expected) {
+    return;
+  }
+
+  let body = await response.text();
+  if (body.length > MAX_ERROR_BODY_LENGTH) {
+    body = `${body.slice(0, MAX_ERROR_BODY_LENGTH)}\n... truncated ...`;
+  }
+
+  throw new Error(`unexpected response code: expected ${expected}, got ${response.status}\n${body || '<empty response body>'}`);
+}
+
+class API {
+  #headers = new Headers({ accept: 'application/json' });
+
+  #baseUrl;
+
+  constructor({ baseUrl, bearerToken } = {}) {
+    assert(baseUrl, 'argument property "baseUrl" missing');
+    this.#baseUrl = baseUrl;
+    if (bearerToken) {
+      this.#headers.set('authorization', `bearer ${bearerToken}`);
+    }
+  }
+
+  async getAllTestModules() {
+    const response = await fetch(new URL('api/runner/available', this.#baseUrl), { headers: this.#headers });
+
+    await assertResponseStatus(response, 200);
+
+    return response.json();
+  }
+
+  async createTestPlan({ planName, configuration, variant } = {}) {
+    assert(planName, 'argument property "planName" missing');
+    assert(configuration, 'argument property "configuration" missing');
+
+    const headers = new Headers(this.#headers);
+    headers.set('content-type', 'application/json');
+
+    const url = new URL('api/plan', this.#baseUrl);
+    url.searchParams.set('planName', planName);
+    if (variant) {
+      url.searchParams.set('variant', variant);
+    }
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(configuration),
+    });
+
+    await assertResponseStatus(response, 201);
+
+    return response.json();
+  }
+
+  async createTestFromPlan({ plan, test, variant } = {}) {
+    assert(plan, 'argument property "plan" missing');
+    assert(test, 'argument property "test" missing');
+
+    const url = new URL('api/runner', this.#baseUrl);
+    url.searchParams.set('test', test);
+    url.searchParams.set('plan', plan);
+    url.searchParams.set('variant', JSON.stringify(variant));
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: this.#headers,
+    });
+
+    await assertResponseStatus(response, 201);
+
+    return response.json();
+  }
+
+  async getModuleInfo({ moduleId } = {}) {
+    assert(moduleId, 'argument property "moduleId" missing');
+
+    const response = await fetch(new URL(`api/info/${moduleId}`, this.#baseUrl), { headers: this.#headers });
+
+    await assertResponseStatus(response, 200);
+
+    return response.json();
+  }
+
+  async getTestLog({ moduleId } = {}) {
+    assert(moduleId, 'argument property "moduleId" missing');
+
+    const response = await fetch(new URL(`api/log/${moduleId}`, this.#baseUrl), { headers: this.#headers });
+
+    await assertResponseStatus(response, 200);
+
+    return response.json();
+  }
+
+  async getModuleState({ moduleId } = {}) {
+    assert(moduleId, 'argument property "moduleId" missing');
+
+    const response = await fetch(new URL(`api/runner/${moduleId}`, this.#baseUrl), { headers: this.#headers });
+
+    await assertResponseStatus(response, 200);
+
+    return response.json();
+  }
+
+  async downloadArtifact({ planId } = {}) {
+    assertPlanId(planId);
+    const filename = `export-${planId}.zip`;
+    const headers = new Headers(this.#headers);
+    headers.set('accept', 'application/zip');
+    const response = await fetch(new URL(`api/plan/exporthtml/${planId}`, this.#baseUrl), { headers });
+
+    await assertResponseStatus(response, 200);
+
+    await pipeline(
+      response.body,
+      createWriteStream(filename),
+    );
+
+    if (process.env.GITHUB_ENV) {
+      writeFileSync(process.env.GITHUB_ENV, `EXPORT_FILE=${filename}\n`, { flag: 'a' });
+    }
+  }
+
+  async waitForState({ moduleId, timeout = ms('4m'), onUpdate } = {}) {
+    assert(moduleId, 'argument property "moduleId" missing');
+    assert(moduleId, 'argument property "states" missing');
+    assert(moduleId, 'argument property "timeout" missing');
+
+    const timeoutAt = Date.now() + timeout;
+
+    while (Date.now() < timeoutAt) {
+      const info = await this.getModuleInfo({ moduleId });
+      await onUpdate?.(info);
+      const { status, result } = info;
+      if (!['WAITING', 'FINISHED', 'RUNNING', 'CREATED'].includes(status)) {
+        debug('module id %s status is %s', moduleId, status);
+      }
+      if (FINISHED.has(status)) {
+        if (!status || !result) continue;
+        if (!RESULTS.has(result)) {
+          throw new Error(`module id ${moduleId} is ${status} but ${result}`);
+        }
+        return [status, result];
+      }
+
+      if (status === 'INTERRUPTED') {
+        debug(await this.getTestLog({ moduleId }));
+        throw new Error(`module id ${moduleId} is ${status}`);
+      }
+
+      await new Promise((resolve) => { setTimeout(resolve, ms('2s')); });
+    }
+
+    debug(`module id ${moduleId} expected state timeout`);
+    throw new Error(`Timed out waiting for test module ${moduleId} to be in one of states: ${[...FINISHED].join(', ')}`);
+  }
+}
+
+export default API;

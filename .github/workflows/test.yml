@@ -1,0 +1,98 @@
+name: Test
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main, trigger-ci]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '55 11 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    if: ${{ github.repository == 'panva/node-oidc-provider' || github.event_name == 'workflow_dispatch' }}
+    uses: panva/.github/.github/workflows/npm-audit.yml@75ad63f5730195dd3e9ec22dbbf29101c99d8501 # v4
+
+  node-versions:
+    if: ${{ github.repository == 'panva/node-oidc-provider' || github.event_name == 'workflow_dispatch' }}
+    uses: panva/.github/.github/workflows/node-versions.yml@75ad63f5730195dd3e9ec22dbbf29101c99d8501 # v4
+    with:
+      min: 22
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+          cache: 'npm'
+          check-latest: true
+      - run: npm clean-install
+      - run: npm run lint
+      - run: node docs/update-configuration.js --check
+      # lib/views is generated from tools/views/*.eta; fail if it was not
+      # regenerated alongside a template change
+      - run: npm run build:views
+      # Make untracked outputs from newly added templates visible to git diff
+      - run: git add --intent-to-add lib/views
+      - run: git diff --exit-code lib/views
+
+  test:
+    needs:
+      - node-versions
+    name: Test Suite
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ${{ fromJSON(needs.node-versions.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup node
+        id: node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          check-latest: true
+      - run: npm clean-install
+      - run: node --test tools/dt/sync-release.test.mjs tools/check-test-focus.test.js tools/with-timeout.test.js
+      - run: node --test certification/runner/test/runner.test.js
+      - run: npm run test-ci
+
+  dist:
+    name: Packaged Artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+          cache: 'npm'
+          check-latest: true
+      - run: npm clean-install
+      # builds dist/, packs it, and runs the suite against the extracted
+      # tarball rather than the working tree
+      - run: npm run test-dist
