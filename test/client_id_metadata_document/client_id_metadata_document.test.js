@@ -9,6 +9,7 @@ import {
   isValidClientIdUrl,
   resolveClientByMetadataDocument,
 } from '../../lib/helpers/client_id_metadata_document.js';
+import { clientConstructionCounters } from '../../lib/helpers/client_construction_counters.js';
 import keys, { stripPrivateJWKFields } from '../keys.js';
 import { TestAdapter } from '../models.js';
 
@@ -1111,6 +1112,106 @@ describe('Client ID Metadata Document', () => {
         { ctx: retryContext, clientId: id },
       ]);
       assert.deepEqual(allowClientCalls, [{ ctx: retryContext, client: retried }]);
+    });
+  });
+
+  describe('cached hit path construction reuse', () => {
+    afterEach(() => timekeeper.reset(), { timeout: 3000 });
+
+    const BATCH = 10;
+
+    function staticProvider() {
+      return createProvider({}, {
+        clients: [{
+          client_id: 'static-client',
+          client_secret: 'secret',
+          redirect_uris: ['https://static.example.com/cb'],
+        }],
+      });
+    }
+
+    it('serves a fixed batch of repeated requests without a full construction per request', { timeout: 3000 }, async () => {
+      const provider = createProvider();
+      const id = 'https://reuse-hit.example.com/client';
+      mockMetadata(id, { client_name: 'reused' });
+
+      const clients = [];
+      for (let i = 0; i < BATCH; i++) {
+        clients.push(await resolve(provider, id));
+      }
+
+      const counters = clientConstructionCounters(provider);
+
+      // One fetch and one complete construction for the whole batch, the
+      // remaining requests are instantiations of that prepared construction.
+      assert.equal(counters.documentFetches, 1);
+      assert.equal(counters.full.metadataDocument, 1);
+      assert.equal(counters.instances.metadataDocument, BATCH);
+      assert.ok(counters.full.metadataDocument < BATCH);
+
+      // Per-request identity and request-scoped processing are preserved.
+      assert.equal(new Set(clients).size, BATCH);
+      clients[0].localMutation = true;
+      clients[0].redirectUris.push('https://app.example.com/other');
+      const next = await resolve(provider, id);
+      assert.notEqual(next, clients[0]);
+      assert.equal(next.clientName, 'reused');
+      assert.ok(!('localMutation' in Object(next)));
+      assert.deepEqual(next.redirectUris, ['https://client.example.com/cb']);
+    });
+
+    it('rebuilds after the document is refetched instead of reusing the stale construction', { timeout: 3000 }, async () => {
+      const provider = createProvider();
+      const id = 'https://stale-construction.example.com/client';
+      timekeeper.freeze(new Date('2026-08-03T12:00:00.000Z'));
+      mockMetadata(id, { client_name: 'first' }, 30);
+
+      assert.equal((await resolve(provider, id)).clientName, 'first');
+
+      timekeeper.travel(Date.now() + 30_001);
+      mockMetadata(id, { client_name: 'refreshed' }, 30);
+
+      const refreshed = await resolve(provider, id);
+      assert.equal(refreshed.clientName, 'refreshed');
+
+      const counters = clientConstructionCounters(provider);
+      assert.equal(counters.documentFetches, 2);
+      assert.equal(counters.full.metadataDocument, 2);
+      assert.equal(counters.instances.metadataDocument, 2);
+    });
+
+    it('shares one full construction between concurrent first requests', { timeout: 3000 }, async () => {
+      const provider = createProvider();
+      const id = 'https://concurrent-construction.example.com/client';
+      mockMetadata(id, { client_name: 'shared' }).delay(20);
+
+      const [first, second] = await Promise.all([
+        resolve(provider, id),
+        resolve(provider, id),
+      ]);
+
+      assert.notEqual(first, second);
+
+      const counters = clientConstructionCounters(provider);
+      assert.equal(counters.documentFetches, 1);
+      assert.equal(counters.full.metadataDocument, 1);
+      assert.equal(counters.instances.metadataDocument, 2);
+    });
+
+    it('leaves static client construction and outbound document fetches unchanged', { timeout: 3000 }, async () => {
+      const provider = staticProvider();
+
+      const clients = [];
+      for (let i = 0; i < BATCH; i++) {
+        clients.push(await provider.Client.find('static-client'));
+      }
+
+      const counters = clientConstructionCounters(provider);
+      assert.equal(counters.full.static, 1);
+      assert.equal(counters.full.metadataDocument, 0);
+      assert.equal(counters.instances.metadataDocument, 0);
+      assert.equal(counters.documentFetches, 0);
+      assert.equal(new Set(clients).size, 1);
     });
   });
 

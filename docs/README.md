@@ -2607,6 +2607,8 @@ The `token_endpoint_auth_methods_supported` client metadata property is processe
 
 When displaying a client's `logo_uri`, applications must prefetch and validate the image and serve it from a trusted server. Applications should display the hostname of the Client Identifier URL to help users identify the client and apply their own trust policies to client-provided metadata.
 
+Requests that hit the metadata document cache are served from one construction prepared per document version: metadata validation and key store assembly run once for that version, each request then receives its own client instance carrying the same validated metadata. A request-scoped callback such as `allowClient` still runs for every request, and a document refetched after its cache duration expires is prepared anew, the cached construction is never reused across document versions.
+
 
 
 
